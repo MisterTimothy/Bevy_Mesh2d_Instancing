@@ -44,7 +44,7 @@ fn vs(
     );
     vertex_output.color = our_struct.color;
     */
-    vertex_output.position = view.clip_from_world * vec4f(
+    vertex_output.position = vec4f(
         vertex.position * vertex.scale + vertex.offset, 0.0, 1.0
     );
     vertex_output.color = vertex.color;

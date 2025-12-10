@@ -1,18 +1,13 @@
+use std::usize;
+
 use bevy::{
-    core_pipeline::{
-        core_2d::{CORE_2D_DEPTH_FORMAT, Transparent2d},
-        core_3d::Transparent3d,
-    },
+    core_pipeline::core_2d::{CORE_2D_DEPTH_FORMAT, Transparent2d},
     ecs::system::lifetimeless::{Read, SRes},
     math::FloatOrd,
     mesh::{PrimitiveTopology, VertexBufferLayout, VertexFormat},
-    pbr::{
-        MeshPipeline, MeshPipelineKey, RenderMeshInstances, SetMeshBindGroup, SetMeshViewBindGroup,
-        SetMeshViewBindingArrayBindGroup,
-    },
     prelude::*,
     render::{
-        Render, RenderApp, RenderStartup, RenderSystems,
+        Render, RenderApp, RenderSystems,
         extract_component::ExtractComponentPlugin,
         extract_resource::ExtractResourcePlugin,
         mesh::{RenderMesh, RenderMeshBufferInfo, allocator::MeshAllocator},
@@ -26,34 +21,28 @@ use bevy::{
             Buffer, BufferInitDescriptor, BufferUsages, ColorTargetState, ColorWrites,
             DepthBiasState, DepthStencilState, FragmentState, FrontFace, PipelineCache,
             PolygonMode, PrimitiveState, RenderPipelineDescriptor, ShaderStages,
-            SpecializedMeshPipeline, SpecializedMeshPipelines, SpecializedRenderPipeline,
-            SpecializedRenderPipelines, StencilFaceState, StencilState, TextureFormat,
-            UniformBuffer, VertexAttribute, VertexState, VertexStepMode,
+            SpecializedRenderPipeline, SpecializedRenderPipelines, StencilFaceState, StencilState,
+            TextureFormat, VertexAttribute, VertexState, VertexStepMode,
             binding_types::uniform_buffer,
         },
-        renderer::{RenderDevice, RenderQueue},
-        sync_world::MainEntity,
+        renderer::RenderDevice,
         view::{
             ExtractedView, RenderVisibleEntities, ViewTarget, ViewUniform, ViewUniformOffset,
             ViewUniforms,
         },
     },
-    sprite_render::{Mesh2dPipeline, Mesh2dPipelineKey, RenderMesh2dInstances},
+    sprite_render::{Mesh2dPipelineKey, RenderMesh2dInstances},
 };
 
-use super::{
-    ChangingInstanceData, InstanceMaterialData, InstanceUniformData, SHADER_ASSET_PATH,
-    StaticInstanceData,
-};
+use crate::vertex_buffer::RenderCustomMesh2dInstances;
+
+use super::{InstanceMaterialData, InstanceUniformData, SHADER_ASSET_PATH};
 
 pub(super) struct CustomMaterialPlugin;
 
 impl Plugin for CustomMaterialPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((
-            ExtractComponentPlugin::<InstanceMaterialData>::default(),
-            ExtractResourcePlugin::<InstanceUniformData>::default(),
-        ));
+        app.add_plugins((ExtractResourcePlugin::<InstanceUniformData>::default(),));
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app.add_render_command::<Transparent2d, DrawCustom>();
@@ -94,11 +83,6 @@ struct InstanceData {
     length: usize,
 }
 
-#[derive(PartialEq, Eq, Hash, Clone)]
-pub struct Custom2dPipelineKey {
-    mesh_key: Mesh2dPipelineKey,
-}
-
 #[derive(Resource)]
 struct Custom2dPipeline {
     shader: Handle<Shader>,
@@ -128,11 +112,11 @@ impl FromWorld for Custom2dPipeline {
 }
 
 impl SpecializedRenderPipeline for Custom2dPipeline {
-    type Key = Custom2dPipelineKey;
+    type Key = Mesh2dPipelineKey;
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
         let layout = vec![self.view_layout.clone()];
 
-        let format = if key.mesh_key.contains(Mesh2dPipelineKey::HDR) {
+        let format = if key.contains(Mesh2dPipelineKey::HDR) {
             ViewTarget::TEXTURE_FORMAT_HDR
         } else {
             TextureFormat::bevy_default()
@@ -209,7 +193,7 @@ impl SpecializedRenderPipeline for Custom2dPipeline {
                 },
             }),
             multisample: bevy::render::render_resource::MultisampleState {
-                count: key.mesh_key.msaa_samples(),
+                count: key.msaa_samples(),
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
@@ -277,17 +261,21 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
         let mesh_allocator = mesh_allocator.into_inner();
 
         let Some(mesh_instance) = render_mesh2d_instances.get(&item.main_entity()) else {
+            info_once!("1");
             return bevy::render::render_phase::RenderCommandResult::Skip;
         };
         let Some(gpu_mesh) = render_meshes.into_inner().get(mesh_instance.mesh_asset_id) else {
+            info_once!("2");
             return bevy::render::render_phase::RenderCommandResult::Skip;
         };
         let Some(vertex_buffer_slice) =
-            mesh_allocator.mesh_index_slice(&mesh_instance.mesh_asset_id)
+            mesh_allocator.mesh_vertex_slice(&mesh_instance.mesh_asset_id)
         else {
+            info_once!("3");
             return bevy::render::render_phase::RenderCommandResult::Skip;
         };
         let Some(instance_data) = instance_data else {
+            info_once!("4");
             return bevy::render::render_phase::RenderCommandResult::Skip;
         };
 
@@ -326,34 +314,47 @@ fn queue_custom(
     custom_pipline: Res<Custom2dPipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<Custom2dPipeline>>,
     pipeline_cache: Res<PipelineCache>,
-    material_meshes: Query<(Entity, &MainEntity), With<InstanceMaterialData>>,
-    views: Query<(&ExtractedView, &Msaa)>,
-    mut render_phases: ResMut<ViewSortedRenderPhases<Transparent2d>>,
+    render_meshes: Res<RenderAssets<RenderMesh>>,
+    render_mesh_instances: Res<RenderCustomMesh2dInstances>,
+    views: Query<(&RenderVisibleEntities, &ExtractedView, &Msaa)>,
+    mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent2d>>,
 ) {
-    let draw_custom = transparent_2d_draw_functions.read().id::<DrawCustom>();
-
-    for (view, msaa) in &views {
-        let Some(transparent_phase) = render_phases.get_mut(&view.retained_view_entity) else {
+    for (visible_entities, view, msaa) in &views {
+        let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
+        else {
             continue;
         };
+
+        let draw_custom = transparent_2d_draw_functions.read().id::<DrawCustom>();
 
         let mesh_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
             | Mesh2dPipelineKey::from_hdr(view.hdr);
 
-        let key = Custom2dPipelineKey { mesh_key };
-        let pipeline = pipelines.specialize(&pipeline_cache, &custom_pipline, key);
+        for (render_entity, visible_entity) in visible_entities.iter::<Mesh2d>() {
+            if let Some(mesh_instance) = render_mesh_instances.get(visible_entity) {
+                let mesh2d_handle = mesh_instance.mesh_asset_id;
+                let mesh2d_transforms = &mesh_instance.transforms;
 
-        for (entity, main_entity) in &material_meshes {
-            transparent_phase.add(Transparent2d {
-                sort_key: FloatOrd(0.0),
-                entity: (entity, *main_entity),
-                pipeline,
-                draw_function: draw_custom,
-                batch_range: 0..1,
-                extracted_index: 0,
-                extra_index: bevy::render::render_phase::PhaseItemExtraIndex::None,
-                indexed: false,
-            });
+                let mut mesh2d_key = mesh_key;
+                let Some(mesh) = render_meshes.get(mesh2d_handle) else {
+                    continue;
+                };
+                mesh2d_key |= Mesh2dPipelineKey::from_primitive_topology(mesh.primitive_topology());
+
+                let pipline_id = pipelines.specialize(&pipeline_cache, &custom_pipline, mesh2d_key);
+
+                let mesh_z = mesh2d_transforms.world_from_local.translation.z;
+                transparent_phase.add(Transparent2d {
+                    sort_key: FloatOrd(mesh_z),
+                    entity: (*render_entity, *visible_entity),
+                    pipeline: pipline_id,
+                    draw_function: draw_custom,
+                    batch_range: 0..1,
+                    extracted_index: usize::MAX,
+                    extra_index: bevy::render::render_phase::PhaseItemExtraIndex::None,
+                    indexed: mesh.indexed(),
+                });
+            }
         }
     }
 }
@@ -375,7 +376,6 @@ fn prepare_instance_buffers(
     }
 
     for (entity, instance_data) in &query {
-        info_once!("There are entities i swear!");
         let static_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("instance data buffer"),
             contents: bytemuck::cast_slice(instance_data.static_data.as_slice()),

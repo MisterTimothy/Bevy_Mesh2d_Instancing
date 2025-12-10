@@ -6,8 +6,15 @@ use bevy::{
     mesh::{MeshVertexAttribute, VertexFormat},
     prelude::*,
     render::{
-        extract_component::ExtractComponent, extract_resource::ExtractResource,
+        Extract, RenderApp,
+        extract_component::ExtractComponent,
+        extract_resource::ExtractResource,
         render_resource::ShaderType,
+        sync_component::SyncComponentPlugin,
+        sync_world::{MainEntityHashMap, RenderEntity},
+    },
+    sprite_render::{
+        Material2dBindGroupId, Mesh2dTransforms, MeshFlags, RenderMesh2dInstance, extract_mesh2d,
     },
     window::PrimaryWindow,
 };
@@ -22,10 +29,20 @@ pub struct InstancingPlugin;
 
 impl Plugin for InstancingPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(instance_material::CustomMaterialPlugin);
+        app.add_plugins((
+            SyncComponentPlugin::<InstanceMaterialData>::default(),
+            instance_material::CustomMaterialPlugin,
+        ));
         app.add_systems(Startup, setup);
+
+        let render_app = app.sub_app_mut(RenderApp);
+        render_app.init_resource::<RenderCustomMesh2dInstances>();
+        render_app.add_systems(ExtractSchedule, extract_custom_mesh2d.after(extract_mesh2d));
     }
 }
+
+#[derive(Resource, Deref, DerefMut, Default)]
+struct RenderCustomMesh2dInstances(MainEntityHashMap<RenderMesh2dInstance>);
 
 fn setup(
     mut commands: Commands,
@@ -83,25 +100,10 @@ fn setup(
 
 // TO-DO:
 // - Split into two structs: StaticData vs ChangingData
-#[derive(Component)]
+#[derive(Clone, Component)]
 struct InstanceMaterialData {
     static_data: Vec<StaticInstanceData>,
     changing_data: Vec<ChangingInstanceData>,
-}
-
-impl ExtractComponent for InstanceMaterialData {
-    type QueryData = &'static InstanceMaterialData;
-    type QueryFilter = ();
-    type Out = Self;
-
-    fn extract_component(
-        item: bevy::ecs::query::QueryItem<'_, '_, Self::QueryData>,
-    ) -> Option<Self::Out> {
-        Some(InstanceMaterialData {
-            changing_data: item.changing_data.clone(),
-            static_data: item.static_data.clone(),
-        })
-    }
 }
 
 #[derive(Debug, Clone, Resource, Reflect, ExtractResource, ShaderType)]
@@ -171,4 +173,40 @@ fn create_circle_vertices(
     }
 
     vertex_data
+}
+
+fn extract_custom_mesh2d(
+    mut commands: Commands,
+    mut previous_len: Local<usize>,
+    query: Extract<
+        Query<(
+            Entity,
+            RenderEntity,
+            &GlobalTransform,
+            &Mesh2d,
+            &InstanceMaterialData,
+        )>,
+    >,
+    mut render_mesh_instances: ResMut<RenderCustomMesh2dInstances>,
+) {
+    let mut values = Vec::with_capacity(*previous_len);
+    for (entity, render_entity, transform, handle, instance_material_data) in &query {
+        let transforms = Mesh2dTransforms {
+            world_from_local: (&transform.affine()).into(),
+            flags: MeshFlags::empty().bits(),
+        };
+        values.push((render_entity, instance_material_data.clone()));
+        render_mesh_instances.insert(
+            entity.into(),
+            RenderMesh2dInstance {
+                transforms,
+                mesh_asset_id: handle.0.id(),
+                material_bind_group_id: Material2dBindGroupId::default(),
+                automatic_batching: false,
+                tag: 0,
+            },
+        );
+    }
+    *previous_len = values.len();
+    commands.try_insert_batch(values);
 }
